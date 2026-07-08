@@ -1,107 +1,120 @@
 package ru.netology;
 
-import java.io.BufferedOutputStream;
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.net.ServerSocket;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.time.LocalDateTime;
-import java.util.List;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class Server {
-    private final int port;
-    private final ExecutorService service;
-    private final List<String> validPaths = List.of(
-            "/index.html", "/spring.svg", "/spring.png", "/resources.html",
-            "/styles.css", "/app.js", "/links.html", "/forms.html", "/classic.html",
-            "/events.html", "/events.js"
-    );
 
-    public Server(int port) {
-        this.port = port;
-        this.service = Executors.newFixedThreadPool(64);
+    private final ExecutorService threadPool = Executors.newFixedThreadPool(64);
+
+    private final ConcurrentHashMap<String, ConcurrentHashMap<String, Handler>> handlers = new ConcurrentHashMap<>();
+
+    public void addHandler(String method, String path, Handler handler) {
+        handlers.computeIfAbsent(method, k -> new ConcurrentHashMap<>()).put(path, handler);
     }
 
-    public void start() {
-        try (final var serverSocket = new ServerSocket(port)) {
+    public void start(int port) throws IOException {
+        try (ServerSocket serverSocket = new ServerSocket(port)) {
+            System.out.println("The server is running on port " + port);
             while (true) {
-                try (
-                        final var socket = serverSocket.accept();
-                        final var in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                        final var out = new BufferedOutputStream(socket.getOutputStream())
-                ) {
-                    // read only request line for simplicity
-                    // must be in form GET /path HTTP/1.1
-                    final var requestLine = in.readLine();
-                    final var parts = requestLine.split(" ");
-
-                    if (parts.length != 3) {
-                        // just close socket
-                        continue;
-                    }
-
-                    final var path = parts[1];
-                    if (!validPaths.contains(path)) {
-                        out.write((
-                                "HTTP/1.1 404 Not Found\r\n" +
-                                        "Content-Length: 0\r\n" +
-                                        "Connection: close\r\n" +
-                                        "\r\n"
-                        ).getBytes());
-                        out.flush();
-                        continue;
-                    }
-
-                    final var filePath = Path.of(".", "public", path);
-                    final var mimeType = Files.probeContentType(filePath);
-
-                    // special case for classic
-                    if (path.equals("/classic.html")) {
-                        classicConnect(out, filePath, mimeType);
-                        continue;
-                    }
-
-                    fileConnect(out, filePath, mimeType);
-                }
+                Socket clientSocket = serverSocket.accept();
+                threadPool.submit(() -> HandleConnection(clientSocket));
             }
-        } catch (IOException e) {
-            e.printStackTrace();
+        } finally {
+            threadPool.shutdown();
         }
     }
 
-    public void classicConnect(BufferedOutputStream out, Path filePath, String mimeType) throws IOException {
-        final var template = Files.readString(filePath);
-        final var content = template.replace(
-                "{time}",
-                LocalDateTime.now().toString()
-        ).getBytes();
-        out.write((
-                "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: " + mimeType + "\r\n" +
-                        "Content-Length: " + content.length + "\r\n" +
-                        "Connection: close\r\n" +
-                        "\r\n"
-        ).getBytes());
-        out.write(content);
-        out.flush();
+    private void HandleConnection(Socket socket) {
+        try (BufferedReader in = new BufferedReader(
+                new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+             OutputStream out = socket.getOutputStream()) {
+
+            // Чтение строки запроса
+            String requestLine = in.readLine();
+            if (requestLine == null || requestLine.isEmpty()) return;
+
+            String[] parts = requestLine.split(" ", 3);
+            if (parts.length < 3) return;
+            String method = parts[0];
+            String fullPath = parts[1];
+
+            // Разбираем путь и query-строку
+            String path;
+            String queryString = null;
+            int queryIndex = fullPath.indexOf('?');
+            if (queryIndex >= 0) {
+                path = fullPath.substring(0, queryIndex);
+                queryString = fullPath.substring(queryIndex + 1);
+            } else {
+                path = fullPath;
+            }
+
+            // Чтение заголовков
+            Map<String, String> headers = new HashMap<>();
+            String headerLine;
+            while (!(headerLine = in.readLine()).isEmpty()) {
+                int colonIndex = headerLine.indexOf(':');
+                if (colonIndex > 0) {
+                    String name = headerLine.substring(0, colonIndex).trim();
+                    String value = headerLine.substring(colonIndex + 1).trim();
+                    headers.put(name, value);
+                }
+            }
+
+            // Чтение тела запроса, если есть Content-Length
+            String body = "";
+            String contentLengthStr = headers.get("Content-Length");
+            if (contentLengthStr != null) {
+                int contentLength = Integer.parseInt(contentLengthStr);
+                char[] bodyChars = new char[contentLength];
+                int read = in.read(bodyChars, 0, contentLength);
+                if (read > 0) {
+                    body = new String(bodyChars, 0, read);
+                }
+            }
+
+            // Формируем объект запроса
+            Request request = new Request(method, path, queryString, headers, body);
+
+            // Ищем подходящий обработчик
+            Handler handler = getHandler(method, path);
+            String responseBody;
+            String statusLine;
+            if (handler != null) {
+                responseBody = handler.handle(request);
+                statusLine = "HTTP/1.1 200 OK";
+            } else {
+                responseBody = "Not Found";
+                statusLine = "HTTP/1.1 404 Not Found";
+            }
+
+            // Отправляем ответ
+            String httpResponse = statusLine + "\r\n" +
+                    "Content-Type: text/plain; charset=UTF-8\r\n" +
+                    "Content-Length: " + responseBody.getBytes(StandardCharsets.UTF_8).length + "\r\n" +
+                    "Connection: close\r\n" +
+                    "\r\n" +
+                    responseBody;
+            out.write(httpResponse.getBytes(StandardCharsets.UTF_8));
+            out.flush();
+        } catch (Exception e) {
+            System.err.println("Connection error: " + e.getMessage());
+        }
     }
 
-    public void fileConnect(BufferedOutputStream out, Path filePath, String mimeType) throws IOException {
-        final var length = Files.size(filePath);
-        out.write((
-                "HTTP/1.1 200 OK\r\n" +
-                        "Content-Type: " + mimeType + "\r\n" +
-                        "Content-Length: " + length + "\r\n" +
-                        "Connection: close\r\n" +
-                        "\r\n"
-        ).getBytes());
-        Files.copy(filePath, out);
-        out.flush();
+    private Handler getHandler(String method, String path) {
+        ConcurrentHashMap<String, Handler> methodHandlers = handlers.get(method);
+        if (methodHandlers != null) {
+            return methodHandlers.get(path);
+        }
+        return null;
     }
+
 }
-
-
